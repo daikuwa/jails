@@ -1,0 +1,19 @@
+
+[devfs_ext_jail=10]
+add hide
+add path log unhide
+add path null unhide
+add path zero unhide
+add path crypto unhide
+add path random unhide
+add path urandom unhide
+add path ptmx unhide
+add path pts unhide
+add path 'pts/*' unhide
+add path fd unhide
+add path 'fd/*' unhide
+add path stdin unhide
+add path stdout unhide
+add path stderr unhide
+add path "bpf*" unhide
+

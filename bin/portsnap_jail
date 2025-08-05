@@ -1,0 +1,82 @@
+#!/bin/sh
+
+BASE_DIR=$(cd $(dirname $0); pwd)
+CONF_FILE="${BASE_DIR}/etc/portsnap_jail.conf"
+
+if [ -f "${CONF_FILE}" ]; then
+   . "${CONF_FILE}"
+fi
+
+: ${jail_os_base:="/usr/local/jails/base/13R"}
+: ${work_dir_in_jail:="${jail_os_base}/var/db/portsnap"}
+: ${ports_dir_in_jail:="${jail_os_base}/usr/ports"}
+: ${portsnap_conf_in_jail:="${jail_os_base}/etc/portsnap.conf"}
+
+# check if root or not.
+_id=`id -u`
+if [ "${_id}" -ne 0 ]; then
+    echo "This script must be executed by root."
+    exit 255
+fi
+
+_execute_portsnap()
+{
+    local _cmd
+    _cmd="${1}"
+    portsnap -d "${work_dir_in_jail}" -p "${ports_dir_in_jail}" "${_cmd}"
+}
+
+_uncomment_refuse_lines()
+{
+    if [ -f "${portsnap_conf_in_jail}" ]; then
+	sed -I '' -E "s/^#[[:blank:]]+(REFUSE.+)/\1/" "${portsnap_conf_in_jail}"
+    else
+	echo "${}"
+    fi
+}
+
+fetch()
+{
+    echo "fetch new archives and patches"
+    _execute_portsnap fetch
+}
+
+extract()
+{
+    echo "do extract"
+    _execute_portsnap extract
+}
+
+update()
+{
+    echo "do update"
+    _execute_portsnap update
+}
+
+help()
+{
+    local _prog_name
+    _prog_name=`basename ${0}`
+    echo "${_prog_name} <command>"
+    echo "command:"
+    echo "   init  : fetch the port archive and extract"
+    echo "   update:  fetch the port archive and update port tres"
+    exit 0
+}
+
+# main
+_task="${1}"
+
+case "${_task}" in
+    init)
+	_uncomment_refuse_lines
+	fetch
+	extract
+    ;;
+    update)
+	fetch
+	update
+    ;;
+    *)
+	help
+esac

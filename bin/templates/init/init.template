@@ -1,0 +1,28 @@
+# params
+
+$base_dir    = "__BASE_DIR__";
+
+$ext_switch  = "__BRIDGE_IF__";
+
+$jail_fstab  = "${base_dir}/etc/${name}.fstab";
+$jail_image  = "${base_dir}/images/${name}.jail";
+$jail_path   = "${base_dir}/servers/${name}";
+
+$dev_dir     = "${jail_path}/dev";
+
+# Dynamic params
+mount.fstab      = "${jail_fstab}";
+path             = "${jail_path}";
+host.hostname    = "${name}";
+exec.consolelog  = "/var/log/jails/jail_${name}_console.log";
+
+# set Default
+vnet            = "new";
+     
+exec.system_user = "root";
+exec.jail_user   = "root";
+
+persist;
+exec.clean;
+allow.raw_sockets;
+

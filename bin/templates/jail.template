@@ -1,0 +1,30 @@
+## __NAME__ entry
+
+__NAME__ {
+     $jail_id        = __ID__;
+     $ip4_addr       = __INET_ADDR__;
+     vnet.interface  = "epair${jail_id}b";
+     
+     exec.prepare    = "mdconfig -t vnode -u ${jail_id} ${jail_image}";
+     exec.prepare   += "fsck /dev/md${jail_id}";
+     exec.prepare   += "mount -o noatime /dev/md${jail_id} ${jail_path}";
+
+     exec.prestart   = "ifconfig epair${jail_id} create up";
+     exec.prestart  += "ifconfig ${ext_switch} addm epair${jail_id}a";
+     exec.prestart  += "ls ${dev_dir}";
+
+     exec.start      = "/sbin/ifconfig epair${jail_id}b inet ${ip4_addr}";     
+     exec.start     += "/bin/sh /etc/rc";
+
+     exec.poststop   = "ifconfig epair${jail_id}a destroy";
+     exec.poststop  += "umount -a -F ${jail_fstab}";
+     exec.poststop  += "sleep 1";
+     
+     exec.release    = "sleep 1";
+     exec.release   += "umount /dev/md${jail_id}";
+     exec.release   += "sleep 1";
+     exec.release   += "mdconfig -d -u ${jail_id}";
+     devfs_ruleset   = 10;
+     mount.devfs;
+}
+

@@ -1,0 +1,435 @@
+#!/bin/sh
+
+BASE_DIR=$(cd $(dirname $0); pwd)
+CONF_FILE="${BASE_DIR}/etc/setup_jail.conf"
+TEMPLATES_DIR="${BASE_DIR}/templates"
+
+FREEBSD_SITE="https://download.freebsd.org/ftp/releases/amd64"
+
+if [ -f "${CONF_FILE}" ]; then
+   . "${CONF_FILE}"
+fi
+
+: ${JAIL_CONF:="${BASE_DIR}/tmp/jail.conf"}
+: ${FSTAB:="${BASE_DIR}/tmp/fstab"}
+: ${DEVFS_RULES:="${BASE_DIR}/tmp/devfs.rules"}
+
+: ${jail_base:="${BASE_DIR}/tmp"}
+: ${switch:="bridge0"}
+: ${base_version:="13.0-RELEASE"}
+: ${zoneinfo:="Asia/Tokyo"}
+: ${jails_default_gw:=""}
+: ${jails_dns_servers:=""}
+
+common_os="${jail_base}/base"
+dist_dir="${common_os}/distfiles"
+running_dir="${common_os}/running"
+
+servers_dir="${jail_base}/servers"
+images_dir="${jail_base}/images"
+jail_etc="${jail_base}/etc"
+
+: ${jail_image_size:="5g"}
+: ${tmp_md_unit:=777}
+
+if [ `id -u` -ne 0 ]; then
+    echo "### This script requires root privilege"
+    exit 255
+fi
+
+init_jail()
+{
+    if [ -f "${JAIL_CONF}" ]; then
+        echo "## ${JAIL_CONF} has already existed"
+        exit 255
+    fi
+
+    cat "${TEMPLATES_DIR}/init/init.template" \
+        | sed -e s@__BASE_DIR__@"${jail_base}"@g \
+              -e s@__BRIDGE_IF__@"${switch}"@g | tee "${JAIL_CONF}"
+
+    if [ ! -d /var/log/jails ]; then
+        echo "## create logs dir /var/log/jails"
+        mkdir -p "/var/log/jails"
+    fi
+
+    _create_dirs
+    _copy_devfs_rules
+    _download_freebsd
+    _extract_freebsd
+}
+
+_create_dirs()
+{
+    local i
+    for i in "${common_os}" "${dist_dir}" "${running_dir}" \
+       "${servers_dir}" "${images_dir}" "${jail_etc}";
+    do
+        echo "## create ${i}"
+        mkdir -p "${i}"
+    done
+}
+
+_copy_devfs_rules()
+{
+    if [ ! -f /etc/devfs.rules ]; then
+        echo "## copy devfs.rules which includes basic rules for jail"
+        cp "${TEMPLATES_DIR}/init/devfs.rules" "${DEVFS_RULES}"
+    else
+        cat "${TEMPLATES_DIR}/init/devfs.rules" | tee -a "${DEVFS_RULES}"
+    fi
+}
+
+_download_freebsd()
+{
+    local i
+    # check if the version available or not
+    fetch -q -o /dev/null \
+          "${FREEBSD_SITE}/${base_version}"
+
+    if [ $? -ne 0 ]; then
+        echo "## the version, ${base_version}, is not available"
+        exit 255
+    fi
+
+    if [ ! -d "${dist_dir}/${base_version}" ]; then
+        echo "## create ${dist_dir}/${base_version}"
+        mkdir -p "${dist_dir}/${base_version}"
+    fi
+
+    for i in "base.txz" "lib32.txz";
+    do
+        fetch -o "${dist_dir}/${base_version}/${i}" \
+              "${FREEBSD_SITE}/${base_version}/${i}"
+    done
+}
+
+_extract_freebsd()
+{
+    local i _targe_dir
+    _target_dir=`echo "${base_version}"| sed -e s/\-/_/g -e s/\\\./_/g`
+
+    if [ ! -d "${common_os}/${_target_dir}" ]; then
+        echo "## create ${common_os}/${_target_dir}"
+        mkdir -p "${common_os}/${_target_dir}"
+    fi
+
+    for i in "base.txz" "lib32.txz";
+    do
+        echo "## extract ${i} into ${common_os}/${_target_dir}"
+        tar xJf "${dist_dir}/${base_version}/${i}" -C "${common_os}/${_target_dir}"
+    done
+    _common_setup "${common_os}/${_target_dir}"
+    _modify_fstab "${common_os}/${_target_dir}"
+}
+
+_common_setup()
+{
+    local _base_os
+    _base_os="${1}"
+    echo "## set timezone as ${zoneinfo}"
+    cp "${_base_os}/usr/share/zoneinfo/${zoneinfo}" "${_base_os}/etc/localtime"
+    echo "## set periodic"
+    cat "${_base_os}/etc/defaults/periodic.conf" \
+        | grep inline \
+        | sed s/NO/YES/g | tee -a "${_base_os}/etc/periodic.conf"
+    echo "## setup syslogd flags"
+    echo "syslogd_flags=\"-ss\"" | tee -a "${_base_os}/etc/rc.conf"
+    if [ -n "${jails_default_gw}" ]; then
+        echo "## setup default gw"
+        echo "defaultrouter=\"${jails_default_gw}\"" | tee -a "${_base_os}/etc/rc.conf"
+    fi
+    echo "## create /root"
+    mkdir -p "${_base_os}/root"
+
+    echo "## setup resolve conf"
+    if [ -n "${jails_dns_servers}" ]; then
+        for i in ${jails_dns_servers};
+        do
+            printf "nameserver %s\n" $i | tee -a "${_base_os}/etc/resolv.conf"
+        done
+    else
+        cp /etc/resolv.conf ${_base_os}/etc/resolv.conf
+    fi
+}
+
+_modify_fstab()
+{
+    local _is_mounted _base_os
+    _base_os="${1}"
+    _is_mounted=`cat /etc/fstab | grep "${running_dir}" | wc -l`
+    if [ "${_is_mounted}" -gt 0 ]; then
+        echo "####"
+        echo "#"
+        echo "# ${running_dir} entry exists on fstab(5)."
+        echo "# fstab need to be modified"
+        echo "#"
+        echo "####"
+    else
+        echo "## add a mount point entry to fstab(5)"
+        echo "${_base_os}       ${running_dir}  nullfs  ro      0       0" >> "${FSTAB}"
+    fi
+}
+
+#
+# $1: jail name
+# $2: jail id
+# $3: ipv4 addr
+#
+# e.g. _append_a_jail www 80 192.0.2.80
+#
+_append_a_jail_conf()
+{
+    local _name _jid _inet_addr
+    _name="${1}"
+    _jid="${2}"
+    _inet_addr="${3}"
+    echo "## create a new jail, ${_name},  config and append it to /etc/jail.conf"
+    cat "${TEMPLATES_DIR}/jail.template" \
+  | sed -e s@__NAME__@"${_name}"@g \
+        -e s@__ID__@"${_jid}"@g \
+        -e s@__INET_ADDR__@"${_inet_addr}"@g | tee -a "${JAIL_CONF}"
+}
+
+#
+# $1: name
+# $2: size (x GB)
+#
+_create_jail_image()
+{
+    local _name _size _image_path
+    _name="${1}"
+    _size="${2}"
+    _image_path="${images_dir}/${_name}.jail"
+
+    if [ -z "${_size}" ]; then
+        _size="${jail_image_size}"
+    fi
+
+    if [ ! -f "${_image_path}" ]; then
+        echo "## create images for ${_name}"
+        truncate -s "${_size}" "${_image_path}"
+        echo "## format the image"
+        mdconfig -t vnode -u "${tmp_md_unit}" "${_image_path}"
+        if [ $? -ne 0 ]; then
+            echo "## Something wrong with /dev/md${tmp_md_unit} or ${_image_path}!!! ##"
+            exit 255
+        fi
+        newfs "/dev/md${tmp_md_unit}"
+        sleep 2
+        mdconfig -d -u "${tmp_md_unit}"
+    else
+        echo "${_image_path} has already exsited"
+        exit 255
+    fi
+}
+
+#
+# $1: jail name
+#
+_create_fstab()
+{
+    local _name _fstab_path
+    _name="${1}"
+    _fstab_path="${jail_etc}/${_name}.fstab"
+    if [ -f "${_fstab_path}" ]; then
+        echo "## fstab for the jail, ${_name} exsits"
+    else
+        echo "## Create fstab for jail, ${_name}"
+        cat "${TEMPLATES_DIR}/fstab.template" \
+            | sed -e s@__BASE__@"${jail_base}"@g \
+                  -e s@__NAME__@"${_name}"@g | tee "${_fstab_path}"
+    fi
+}
+
+#
+# $1: jail name
+#
+_create_server_dir()
+{
+    local _name _dir
+    _name="${1}"
+    _dir="${servers_dir}/${_name}"
+    if [ -d "${_dir}" ]; then
+        echo "## ${_dir} exists and may be used by other jail"
+        exit 255
+    else
+        echo "## create a mount point for jail, ${_dir}"
+        mkdir -p "${servers_dir}/${_name}"
+    fi
+}
+
+_check_jid()
+{
+    local _jid _l
+    _jid="${1}"
+    if [ -z "${_jid}" ]; then
+        echo "255"
+    else
+        _l=`cat "${JAIL_CONF}" | grep -e '\$jail_id\s*=' | cut -d '=' -f 2 | grep "${_jid}" | wc -l`
+        echo "${_l}"
+    fi
+}
+
+_check_name()
+{
+    local _name _l
+    _name="${1}"
+    if [ -z "${_name}" ]; then
+        echo "255"
+    else
+        _l=`cat ${JAIL_CONF} | grep -e "\s*${_name}\s*{\s*" | wc -l`
+        echo "${_l}"
+    fi
+}
+
+_check_inet_addr()
+{
+    local _inet_addr
+    _inet_addr="${1}"
+    if [ -z "${_inet_addr}" ]; then
+        echo "255"
+    else
+        # TBD
+        echo "0"
+    fi
+}
+
+#
+# $1: jail name
+# $2: jail id
+# $3: ipv4 address for the jail
+# $4: size of the image, eg. 10g (optional)
+#
+create_a_jail()
+{
+    local _name _jid _inet_addr _size
+    _name="${1}"
+    _jid="${2}"
+    _inet_addr="${3}"
+    _size="${4}"
+    if [ `_check_name "${_name}"` -ne 0 ]; then
+        if [ -z "${_name}" ]; then
+            echo "The jail name must be provided"
+        else
+            echo "The jail, ${_name}, exists."
+        fi
+        exit 255
+    fi
+
+    if [ `_check_jid "${_jid}"` -ne 0 ]; then
+        if [ -z "${_jid}" ]; then
+            echo "jid must be provided"
+        else
+            echo "The jid ${_jid} exists"
+        fi
+        exit 255
+    fi
+
+    if [ `_check_inet_addr "${_inet_addr}"` -ne 0 ]; then
+        echo "inet addr must be provided"
+        exit 255
+    fi
+
+    _create_jail_image "${_name}" "${_size}"
+    _create_fstab "${_name}"
+    _create_server_dir "${_name}"
+    _append_a_jail_conf "${_name}" "${_jid}" "${_inet_addr}"
+}
+
+#
+# prepare update
+#
+# $1: new release name
+#
+prepare_update()
+{
+    local _version
+    _version="${1}"
+    if [ -z "${_version}" ]; then
+        echo "## the target version must be specified"
+        exit 255
+    fi
+    base_version="${_version}"
+    _download_freebsd
+    _extract_freebsd
+}
+
+show_help()
+{
+    local _prog
+    _prog=`basename "${0}"`
+    echo "Usage: ${_prog} [options] command"
+    echo "   options may include:"
+    echo "      -s: size of a jail image (e.g. 2g, 10g, 500m, see trancate(1))"
+    echo "      -n: name of the jail"
+    echo "      -j: id of the jail"
+    echo "      -4: ipv4 address of the jail"
+    echo "      -R: Release version of the FreeBSD"
+    echo "      -h: print this message"
+    echo ""
+    echo "   command must be one of the followings:"
+    echo "      init   : initial setup for jails environmnent"
+    echo "      create : create a jail"
+    echo "      prepare: prepare for updating the base environment"
+}
+
+while getopts "s:n:j:4:R:h" opt
+do
+    case ${opt} in
+        s)
+            jail_image_size="${OPTARG}"
+            ;;
+        n)
+            jail_name="${OPTARG}"
+            ;;
+        j)
+            jid="${OPTARG}"
+            ;;
+        4)
+            ipv4="${OPTARG}"
+            ;;
+        R)
+            target_version="${OPTARG}"
+            ;;
+        h)
+            show_help
+            exit 0
+            ;;
+        *)
+            show_help
+            exit 255
+      ;;
+    esac
+done
+shift `expr ${OPTIND} - 1`
+
+if [ $# -ne 1 ]; then
+    show_help
+    exit 255
+fi
+
+_command="${1}"
+
+case "${_command}" in
+    init)
+        echo "## Init Jail Environment"
+        if [ -n "${target_version}" ]; then
+            base_version="${target_version}"
+        fi
+        init_jail
+        ;;
+    prepare)
+        echo "## Prepare for upgrading the base to ${target_version}"
+        prepare_update "${target_version}"
+        ;;
+    create)
+        echo "## Create a Jail, ${jail_name}"
+        create_a_jail "${jail_name}" "${jid}" \
+                      "${ipv4}" "${jail_image_size}"
+        ;;
+    *)
+        show_help
+        exit 255
+        ;;
+esac
